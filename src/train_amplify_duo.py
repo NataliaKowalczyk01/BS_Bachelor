@@ -12,13 +12,14 @@ import numpy as np
 import random
 from layers import Attention, MultiHeadAttention
 from keras.models import Model
-from keras.layers import Masking, Dense, LSTM, Bidirectional, Input, Dropout, Concatenate
+from keras.layers import Masking, Dense, LSTM, Bidirectional, Input, Dropout, Concatenate, Layer
 from keras.callbacks import EarlyStopping
 from keras.optimizers.legacy import Adam
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix
 import tensorflow as tf
 from keras.backend import int_shape
+from keras.losses import BinaryCrossentropy
 
 MAX_LEN = 200 # max length for input sequences
 
@@ -59,19 +60,68 @@ def predict_by_class(scores):
             classes.append(0)
     return np.array(classes)
 
-def combined_binary_crossentropy(y_true, y_pred):
+from keras.losses import BinaryCrossentropy
+import tensorflow as tf
+
+def base_loss(y_true, y_pred):
+    """
+    Strata bazowa (L_base) dla modelu, używająca binarnej krzyżowej entropii.
+
+    Args:
+        y_true (tf.Tensor): Rzeczywiste etykiety (0 lub 1).
+        y_pred (tf.Tensor): Przewidywania modelu.
+    Returns:
+        tf.Tensor: Wartość straty bazowej.
+    """
+
     y_true_activity = y_true[:, 0:1]
     y_true_toxicity = y_true[:, 1:2]
     
     y_pred_activity = y_pred[0]
     y_pred_toxicity = y_pred[1]
-    
+
     loss_activity = tf.keras.losses.binary_crossentropy(y_true_activity, y_pred_activity)
     loss_toxicity = tf.keras.losses.binary_crossentropy(y_true_toxicity, y_pred_toxicity)
     
     return (loss_activity + loss_toxicity) / 2
 
+def contrastive_loss(y_true, y_pred):
+    margin = 2.0
+    # Podział predykcji na aktywność i toksyczność
+    y_true_activity = y_true[:, 0:1]
+    y_true_toxicity = y_true[:, 1:2]
 
+    y_pred_activity = y_pred[0]
+    y_pred_toxicity = y_pred[1]
+
+    # Obliczanie odległości euklidesowej
+    euclidean_distance = tf.sqrt(tf.reduce_sum(tf.square(y_pred_activity - y_pred_toxicity), axis=1))
+    # Strata kontrastowa
+    if [y_true_activity, y_true_toxicity]== [y_pred_activity, y_pred_toxicity]:
+        y=1
+    else:
+        y=0
+    loss = tf.reduce_mean((1 - y) * tf.square(euclidean_distance) +
+                          y * tf.square(tf.maximum(margin - euclidean_distance, 0)))
+    return loss
+
+def combined_loss(y_true, y_pred):
+    """
+    Kombinowana funkcja straty (L_base + L_contrast).
+
+    Args:
+        y_true (tf.Tensor): Rzeczywiste etykiety.
+        y_pred (tf.Tensor): Przewidywania modelu.
+    Returns:
+        tf.Tensor: Łączna wartość straty.
+    """
+    # Oblicz straty bazowe i kontrastowe
+    l_base = base_loss(y_true, y_pred)
+    l_contrast = contrastive_loss(y_true, y_pred)
+    
+    # Łączna strata
+    total_loss = l_base + l_contrast
+    return total_loss
 
 def build_attention():
     """
@@ -99,7 +149,7 @@ def build_amplify_architecture_attention():
                                 return_multi_attention=False, name='Multi-Head-Attention')(hidden)
     hidden = Dropout(0.2, name = 'Dropout_1')(hidden)
     attention = Attention(name='Attention', return_attention=False)(hidden)
-    prediction = Dense(1, activation='sigmoid', name='Output')(attention)
+    #prediction = Dense(1, activation='sigmoid', name='Output')(attention)
     model = Model(inputs=inputs, outputs=attention)
     return model
 
@@ -136,6 +186,55 @@ def load_base_model():
 
     return out_model[0]
 
+class BaseModelLayer(Layer):
+    """Stack of Linear layers with a sparsity regularization loss."""
+
+    def __init__(self):
+        super().__init__()
+        self.model_amplify_activity = load_base_model()
+        self.model_amplify_toxicity = load_base_model()
+        
+        
+        for layer in self.model_amplify_activity.layers: # Freeze the layers
+            layer.trainable = False
+        for layer in self.model_amplify_toxicity.layers: # Freeze the layers
+            layer.trainable = False  
+
+
+    def call(self, inputs):
+        attention_activity = self.model_amplify_activity(inputs)
+        attention_toxicity = self.model_amplify_toxicity(inputs)
+
+        # Dense layers for prediction
+        concatenated = Concatenate(name='Concatenate', axis=-1)([attention_activity, attention_toxicity])
+
+        prediction_activity = Dense(1, activation='sigmoid', name='Output_activity')(concatenated)
+        prediction_toxicity = Dense(1, activation='sigmoid', name='Output_toxicity')(concatenated)
+        self.add_loss(contrastive_loss(attention_activity, attention_toxicity, prediction_activity, prediction_toxicity, ))
+        
+        return concatenated
+
+def build_duo_model_with_custom_layer():
+    """
+    Build the model architecture using BaseModelLayer.
+    """
+    inputs = Input(shape=(MAX_LEN, 20), name='Input_duo')
+
+    # Zastosowanie customowej warstwy opartej o klasę BaseModelLayer
+    base_layer_output = BaseModelLayer()(inputs)
+    # Dense layers for prediction
+    prediction_activity = Dense(1, activation='sigmoid', name='Output_activity')(base_layer_output)
+    prediction_toxicity = Dense(1, activation='sigmoid', name='Output_toxicity')(base_layer_output)
+
+    # Definicja modelus
+    duo_model = Model(inputs=inputs, outputs=[prediction_activity, prediction_toxicity])
+
+    # Kompilacja modelu z własną funkcją straty
+    adam = Adam(learning_rate=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-7, decay=0.0, amsgrad=False)
+    duo_model.compile(loss=combined_loss, optimizer=adam, metrics=['accuracy'])
+
+    return duo_model
+
 def build_duo_model():
     """
     Build the model architecture for base siamese model with attention, returning probabilities for activity and toxicity.
@@ -148,26 +247,16 @@ def build_duo_model():
     model_amplify_activity = load_base_model()
     model_amplify_toxicity = load_base_model()
 
-    #model_layers =["Input","Masking", "Bidirectional-LSTM", "MHD", "Dropout", "Attention"]
-    #i=0
-
     for layer in model_amplify_activity.layers: # Freeze the layers, check by get_weights()
-        #print("wagi:", print(model_layers[i]), layer.get_weights())
         layer.trainable = False
-        #print(model_layers[i], layer.output_shape)
-        #i+=1
 
     for layer in model_amplify_toxicity.layers: # Freeze the layers
         layer.trainable = False  
     # Apply models to inputs
-    attention_activity_output = model_amplify_activity(inputs_combined)
-    attention_toxicity_output = model_amplify_toxicity(inputs_combined)
+    attention_1 = model_amplify_activity(inputs_combined)
+    attention_2 = model_amplify_toxicity(inputs_combined)
 
-    concatenated = Concatenate(name='Concatenate', axis =-1)([attention_activity_output, attention_toxicity_output])
-
-    print("Concatenated")
-    # Sprawdzenie, czy tensor ma odpowiedni kształt dla warstwy Dense
-    print("Kształt po Concatenate:", concatenated.shape)
+    concatenated = Concatenate(name='Concatenate', axis =-1)([attention_1, attention_2])
 
     # Dense layers for prediction
     prediction_activity = Dense(1, activation='sigmoid', name='Output_activity')(concatenated)
@@ -177,10 +266,9 @@ def build_duo_model():
     duo_model = Model(inputs=[inputs_combined], outputs=[prediction_activity, prediction_toxicity])
 
     adam = Adam(learning_rate=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-7, decay=0.0, amsgrad=False)
-    duo_model.compile(loss=combined_binary_crossentropy, optimizer=adam, metrics=['accuracy'])
+    duo_model.compile(loss=base_loss, optimizer=adam, metrics=['accuracy'])
     print(duo_model.summary())
     return duo_model
-
 
 def main():
     parser = argparse.ArgumentParser(description=dedent('''
@@ -222,9 +310,13 @@ def main():
         non_amp_act_train.append(str(seq_record.seq))
 
     # sequences for training sets (activity)
-    train_act_seq = amp_act_train + non_amp_act_train    
+    train_act_seq = amp_act_train + non_amp_act_train
+
+    train_act_seq = train_act_seq[:100]
     # set labels for training sequences
     y_act_train = np.array([1]*len(amp_act_train) + [0]*len(non_amp_act_train))
+
+    y_act_train=y_act_train[:100]
 
     # shuffle training set
     train_act = list(zip(train_act_seq, y_act_train))
@@ -244,8 +336,12 @@ def main():
 
     # sequences for training sets (toxicity)
     train_tox_seq = AMP_tox_train + non_AMP_tox_train
+
+    train_tox_seq = train_tox_seq[:100]
     # set labels for training sequences (toxicity)
     y_tox_train = np.array([0]*len(train_tox_seq))
+
+    y_tox_train = y_tox_train[:100]
 
     i=0
     for seq in train_act_seq:
@@ -256,7 +352,7 @@ def main():
     y_combined = np.array(list(zip(y_act_train, y_tox_train)))
 
     # generate one-hot encoding input and pad sequences into MAX_LEN long
-    X_act_train = one_hot_padding(train_act_seq, MAX_LEN)
+    X_union = one_hot_padding(train_act_seq, MAX_LEN)
     
     indv_pred_train = [] # list of predicted scores for individual models on the training set
 
@@ -266,30 +362,27 @@ def main():
     save_file_num = 0
     
 
-    for tr_ens, te_ens in ensemble.split(X_act_train, y_act_train):
+    for tr_ens, te_ens in ensemble.split(X_union, y_act_train):
         model = build_duo_model()
         print("Model został zbudowany")
 
         early_stopping = EarlyStopping(monitor='val_accuracy',  min_delta=0.001, patience=50, restore_best_weights=True)
-        model.fit(X_act_train[tr_ens], np.array(y_combined[tr_ens]), epochs=10, batch_size=32, 
-                      validation_data=(X_act_train[te_ens], y_combined[te_ens]), verbose=2, initial_epoch=0, callbacks=[early_stopping])
+        model.fit(X_union[tr_ens], np.array(y_combined[tr_ens]), epochs=1, batch_size=200, 
+                      validation_data=(X_union[te_ens], y_combined[te_ens]), verbose=2, initial_epoch=0, callbacks=[early_stopping])
 
         # Predicting on the training set
-        temp_pred_train = model.predict(X_act_train)
+        temp_pred_train = model.predict(X_union)
         temp_pred_train_activity = temp_pred_train[0].flatten()
         temp_pred_train_toxicity = temp_pred_train[1].flatten()
 
         indv_pred_train.append((temp_pred_train_activity, temp_pred_train_toxicity))
 
-
-        save_file_num = save_file_num + 1
-        save_dir = args.out_dir + '/' + args.model_name + '_' + str(save_file_num) + '.h5'
-        save_dir_wt = args.out_dir + '/' + args.model_name + '_weights_' + str(save_file_num) + '.h5'
-        model.save(save_dir) #save
-        model.save_weights(save_dir_wt) #save
-
         train_pred_classes_activity = predict_by_class(temp_pred_train_activity)
         train_pred_classes_toxicity = predict_by_class(temp_pred_train_toxicity)
+        print("y_act_train", y_combined)
+        print("y shape", int_shape(y_combined))
+        print("train_pred_classes_activity",  train_pred_classes_activity)
+        print("shape train",  int_shape(train_pred_classes_activity))
 
         # Calculate training accuracy for activity and toxicity
         train_acc_activity = accuracy_score(y_act_train, train_pred_classes_activity)
@@ -297,7 +390,7 @@ def main():
         train_acc_combined = (train_acc_activity + train_acc_toxicity) / 2
 
         # Predicting on the validation set
-        temp_pred_val = model.predict(X_act_train[te_ens])
+        temp_pred_val = model.predict(X_union[te_ens])
         temp_pred_val_activity = temp_pred_val[0].flatten()
         temp_pred_val_toxicity = temp_pred_val[1].flatten()
 
@@ -310,6 +403,13 @@ def main():
         val_acc_toxicity = accuracy_score(y_tox_train[te_ens], val_pred_classes_toxicity)
         val_acc_combined = (val_acc_activity + val_acc_toxicity) / 2
 
+        '''
+        save_file_num = save_file_num + 1
+        save_dir = args.out_dir + '/' + args.model_name + '_' + str(save_file_num) + '.h5'
+        save_dir_wt = args.out_dir + '/' + args.model_name + '_weights_' + str(save_file_num) + '.h5'
+        model.save(save_dir) #save
+        model.save_weights(save_dir_wt) #save
+        '''
         
         print('*************************** current model ***************************')
         print('current train acc (activity): ', train_acc_activity)
