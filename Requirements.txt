@@ -1,0 +1,7 @@
+tensorflow==2.10
+keras==2.10
+numpy==1.24
+pandas
+scikit-learn
+biopython
+h5py
